@@ -8,7 +8,7 @@ function print_banner(io)
         io,
         "--------------------------------------------------------------------------------",
     )
-    printstyled(io, "                     fast Robust Dual Dynamic Programming (fRDDP) (c) Yunhui Shi, 2021\n";color=:red)
+    printstyled(io, "                  DEV   fast Robust Dual Dynamic Programming (fRDDP) (c) Yunhui Shi, 2021\n";color=:red)
     println(io)
 end
 function print_banner_v2(io)

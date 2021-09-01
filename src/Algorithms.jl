@@ -123,12 +123,15 @@ function ForwardPassPrimal(msro,start,stop)
                 end
             end
             msro.upper[t][:wst_case] = wst_case
-        end    
+        end
         for i in 1:length(msro.upper[t][:wst_case])
             fix(msro.lower[t][:uncertain][i],msro.upper[t][:wst_case][i]; force=true)
+            fix(msro.upper[t][:uncertain][i],msro.upper[t][:wst_case][i]; force=true)
         end
         Suppressor.@suppress_out optimize!(msro.lower[t])
+        Suppressor.@suppress_out optimize!(msro.upper[t])
         @assert termination_status(msro.lower[t]) == MOI.OPTIMAL
+        @assert termination_status(msro.upper[t]) == MOI.OPTIMAL
         global total_solves
         total_solves += 2
         if t < length(msro.upper)
@@ -217,7 +220,7 @@ function train(msro)
     total_solves,sceanio_not_change_num,gap_temp,no_improvement = 0,0,9999,0
     start,stop = 1,length(msro.lower)
     additional = Dict()
-    solution_status = DataFrames.DataFrame(UpperBound=[],LowerBound=[],Gap=[],Time=[],TotalSolves=[]) 
+    solution_status = DataFrames.DataFrame(Iteration=[],UpperBound=[],LowerBound=[],Gap=[],Time=[],TotalSolves=[]) 
     print_banner(stdout)
     print_iteration_header(stdout)
     t1 = time()
@@ -234,6 +237,7 @@ function train(msro)
         additional[:TotalSolves] = total_solves
         t2 = time()
         additional[:Time] = t2 - t1
+        pop!(additional,:gaphourly)
         print_iteration(stdout,additional)
         if n_iter >= 2
             push!(solution_status,additional)
@@ -307,6 +311,7 @@ function buildMultiStageRobustModel(creator::Function;N_stage::Int,optimizer,Max
         m[:initial_value] = []
         m[:uncertain] = []
         creator(m,t)
+        @objective(m,Min,0)
         for v ∈ JuMP.all_variables(m) # delete non-uncertain variables
             if v ∉ m[:uncertain]
                 JuMP.delete(m,v)
