@@ -8,7 +8,6 @@ mutable struct MultiStageRobustModel
     uncertain::Array{JuMP.Model}
     config::Dict
 end
-
 function add_upper_bound(msro,t,n_iter)
     dual_of_obj = @variable(msro.upper[t],lower_bound=0)
     if n_iter == 1
@@ -254,19 +253,50 @@ function train(msro)
         end
         Suppressor.@suppress_out BackwardPassPrimal(msro,n_iter,start,stop)
     end
+    for key in keys(msro.lower[1][:objectives])
+        obj = sum(value(msro.lower[t][:objectives][key]) for t in 1:length(msro.lower))
+        println("$key :  $obj")
+    end
     return solution_status
+end
+function evaluate(msro::MultiStageRobustModel,num,creator::Function)
+    Random.seed!(1234)
+    vertice = []
+    for t in 1:length(msro.lower)
+        m = JuMP.Model()
+        creator(m,t)
+        poly = Polyhedra.polyhedron(m, CDDLib.Library())
+        push!(vertice,[v for v in Polyhedra.points(Polyhedra.vrep(poly))])
+    end
+    objectives = []
+    for i in 1:num
+        nk = length(vertice[1])
+        trajectory = [vertice[t][randperm(nk)[1]] for t in 1:T]
+        obj_tmp = 0
+        for t in 1:length(msro.lower)
+            for i in 1:length(trajectory[t])
+                fix(msro.lower[t][:uncertain][i],trajectory[t][i]; force=true)
+            end
+            Suppressor.@suppress_out optimize!(msro.lower[t])
+            @assert termination_status(msro.lower[t]) == MOI.OPTIMAL #OPTIMAL
+            obj_tmp += value(msro.lower[t][:cost_now])
+        end
+        push!(objectives,obj_tmp)
+    end
+    return objectives
 end
 function buildMultiStageRobustModel(creator::Function;N_stage::Int,optimizer,MaxIteration=100,MaxTime=3600,Gap=0.01,initial_penalty = 1e6,use_maxmin_solver=false)
     msro = Suppressor.@suppress_out MultiStageRobustModel(
         [JuMP.Model(with_optimizer(optimizer)) for t in 1:N_stage],
         [JuMP.Model(with_optimizer(optimizer)) for t in 1:N_stage],
-        [JuMP.Model(with_optimizer(Ipopt.Optimizer)) for t in 1:N_stage],
+        [JuMP.Model(with_optimizer(optimizer)) for t in 1:N_stage],
         Dict([("MaxIteration",MaxIteration),("MaxTime",MaxTime),("Gap",Gap),("no_improvement",100),("initial_penalty",initial_penalty),("use_maxmin_solver",use_maxmin_solver)]))
     for t in 1:N_stage # construct upper bound problem
         m = msro.upper[t]
         m[:state] = []
         m[:initial_value] = []
         m[:uncertain] = []
+        m[:objectives] = Dict()
         # set_parameter(m[:uncertain_problem],"NonConvex",2)
         creator(m,t)
         if t == 1
@@ -274,6 +304,7 @@ function buildMultiStageRobustModel(creator::Function;N_stage::Int,optimizer,Max
                 fix(m[:state][i].in,m[:initial_value][i])
             end
         end
+        m[:cost_now] = objective_function(m)
         if t < N_stage
             @variable(m,cost_to_go,lower_bound=0)
             @variable(m,τu[1:length(m[:state])],lower_bound=0)
@@ -291,12 +322,14 @@ function buildMultiStageRobustModel(creator::Function;N_stage::Int,optimizer,Max
         m[:state] = []
         m[:initial_value] = []
         m[:uncertain] = []
+        m[:objectives] = Dict()
         creator(m,t)
         if t == 1
             for i in 1:length(m[:state])
                 fix(m[:state][i].in,m[:initial_value][i])
             end
         end
+        m[:cost_now] = objective_function(m)
         if t < N_stage
             @variable(m,cost_to_go,lower_bound=0)
             @objective(m,Min,objective_function(m) + cost_to_go)
@@ -310,6 +343,7 @@ function buildMultiStageRobustModel(creator::Function;N_stage::Int,optimizer,Max
         m[:state] = []
         m[:initial_value] = []
         m[:uncertain] = []
+        m[:objectives] = Dict()
         creator(m,t)
         @objective(m,Min,0)
         for v ∈ JuMP.all_variables(m) # delete non-uncertain variables
@@ -352,17 +386,24 @@ end
 function evaluate_under_worst_case(msro,worst_case)
     total_cost = 0
     for t in 1:length(worst_case)
-        fixprev(msro,t)
-        for (idx,gen) in enumerate(keys(msro.case_dict[:windfarm]))
-            vertex = [v for v in worst_case]
-            windpower = msro.data[t][:wind_power]
-            # @assert abs(vertex[idx]) <= 0.5
-            fix(msro.lower[t][:Pw_err][gen],vertex[t][idx]*windpower[gen])
+        if t > 1
+            for i in 1:length(msro.lower[t][:state])
+                fix(msro.lower[t][:state][i].in,value(msro.lower[t-1][:state][i].out))
+            end
         end
+        for i in 1:length(worst_case[t])
+            fix(msro.lower[t][:uncertain][i],worst_case[t][i]; force=true)
+        end
+        Suppressor.@suppress_out optimize!(msro.lower[t])
+        @assert termination_status(msro.lower[t]) == MOI.OPTIMAL
         Suppressor.@suppress_out optimize!(msro.lower[t])
         # println(value(m[t][:cost_now]))
         @assert termination_status(msro.lower[t]) == MOI.OPTIMAL #OPTIMAL
         total_cost += value(msro.lower[t][:cost_now])
+    end
+    for key in keys(msro.lower[1][:objectives])
+        obj = sum(value(msro.lower[t][:objectives][key]) for t in 1:length(msro.lower))
+        println("$key :  $obj")
     end
     return total_cost
     # ForwardPassPrimal(msro,1,length(msro.lower))
@@ -388,12 +429,11 @@ function evaluate_under_worst_case(leader,follower,worst_case)
     end
     return total_cost
 end
-function evaluate(msro)
+function evaluate(msro,n)
     Random.seed!(1235)
-    n = 10
     T = length(msro.lower)
     trajectory = []
-    vts = msro.vertice
+    vts = [msro.upper[t][:vertex] for t in 1:T]
     nk = length(vts[1])
     for i = 1:n
         trajectory_i = [vts[t][randperm(nk)[1]] for t in 1:T]
@@ -404,32 +444,28 @@ function evaluate(msro)
     # p = Progress(n)
     worst_index,tmp_worst = 1,0
     for k in 1:n
-        # total_cost[k] = value(dayahead[:cost_now])
-        m = msro.lower
-        total_cost = 0
+        vertex = trajectory[k]
         for t in 1:T
-            fixprev(msro,t)
-            for (idx,gen) in enumerate(keys(msro.case_dict[:windfarm]))
-                vertex = trajectory[k][t]
-                windpower = msro.data[t][:wind_power]
-                # @assert abs(vertex[idx])*m[t][:α] <= 0.5
-                fix(m[t][:Pw_err][gen],vertex[idx]*m[t][:α]*windpower[gen])
+            for i in 1:length(trajectory[k][t])
+                fix(msro.lower[t][:uncertain][i],trajectory[k][t][i]; force=true)
             end
-            Suppressor.@suppress_out optimize!(m[t])
+            Suppressor.@suppress_out optimize!(msro.lower[t])
+            @assert termination_status(msro.lower[t]) == MOI.OPTIMAL
+            Suppressor.@suppress_out optimize!(msro.lower[t])
             # println(value(m[t][:cost_now]))
-            @assert termination_status(m[t]) == MOI.OPTIMAL #OPTIMAL
-            total_cost += value(m[t][:cost_now])
+            @assert termination_status(msro.lower[t]) == MOI.OPTIMAL #OPTIMAL
+            total_cost += value(msro.lower[t][:cost_now])
         end
         if total_cost > tmp_worst
             tmp_worst = total_cost
             worst_index = k
         end
-        push!(objectives,[total_cost,value(m[T][:Ew])/value(m[T][:Ew_max]),value(m[T][:Ses][1]),sum(value(m[t][:load_Cut_cost]) for t in 1:T)])
-        push!(Ses,[value(msro.lower[t][:Ses][1]) for t in 1:T])
+        push!(objectives,total_cost)
+        # push!(objectives,[total_cost,value(m[T][:Ew])/value(m[T][:Ew_max]),value(m[T][:Ses][1]),sum(value(m[t][:load_Cut_cost]) for t in 1:T)])
+        # push!(Ses,[value(msro.lower[t][:Ses][1]) for t in 1:T])
     end
     trajectory_worst = trajectory[worst_index]
-    m = msro.lower
-    return [x[1] for x in objectives],[x[2] for x in objectives],[x[3] for x in objectives],[x[4] for x in objectives]
+    return mean(objectives),tmp_worst
 end
 function evaluate(leader,follower)
     Random.seed!(1235)

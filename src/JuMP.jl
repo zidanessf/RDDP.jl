@@ -24,6 +24,7 @@ function JuMP.build_variable(
     info::JuMP.VariableInfo,
     ::Type{State};
     initial_value = NaN,
+    is_binary = false,
     kwargs...,
 )
     if isnan(initial_value)
